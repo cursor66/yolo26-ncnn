@@ -1,0 +1,369 @@
+#include "yolo26.h"
+
+#include <algorithm>
+#include <cmath>
+
+#include <opencv2/imgproc/imgproc.hpp>
+
+#include "net.h"
+#include "cpu.h"
+
+#include "yolo26_preprocess.h"
+#include "yolo26_ops.h"
+#include "yolo26_ncnn_io.h"
+#include "yolo26_ncnn_mat.h"
+#include "yolo26_topk.h"
+#include "yolo26_nms.h"
+
+Yolo26::Yolo26(const Yolo26Config& config)
+    : config_(config), net_(std::make_shared<ncnn::Net>())
+{
+}
+
+Yolo26::~Yolo26() = default;
+
+bool Yolo26::load(const std::string& param_path, const std::string& bin_path)
+{
+    if (!net_)
+        net_ = std::make_shared<ncnn::Net>();
+
+#if NCNN_VULKAN
+    net_->opt.use_vulkan_compute = config_.use_gpu;
+#endif
+    net_->opt.num_threads = ncnn::get_big_cpu_count();
+
+    if (net_->load_param(param_path.c_str()) != 0)
+        return false;
+    if (net_->load_model(bin_path.c_str()) != 0)
+        return false;
+
+    return true;
+}
+
+bool Yolo26::detect(const cv::Mat& bgr, std::vector<Yolo26Object>& objects) const
+{
+    if (!net_ || bgr.empty())
+        return false;
+
+    const int img_w = bgr.cols;
+    const int img_h = bgr.rows;
+
+    yolo26::LetterBoxInfo lb;
+    ncnn::Mat in_pad;
+    if (!yolo26::letterbox(bgr,
+                           config_.input_width,
+                           config_.input_height,
+                           config_.padding_value,
+                           config_.scaleup,
+                           config_.center,
+                           in_pad,
+                           lb))
+        return false;
+    yolo26::normalize_01_inplace(in_pad);
+
+    ncnn::Extractor ex = net_->create_extractor();
+    if (!yolo26::ncnn_input_image(ex, config_.input_name, in_pad))
+        return false;
+
+    ncnn::Mat out;
+    if (!yolo26::ncnn_extract_out0(ex, config_.output_name, out))
+        return false;
+
+    ncnn::Mat out_2d;
+    if (!yolo26::to_mat2d(out, out_2d))
+        return false;
+
+    const int det_dim = 4 + config_.num_classes;
+    const bool is_end2end_out = (out_2d.w == 6 && out_2d.h > 0) || (out_2d.h == 6 && out_2d.w > 0);
+    Yolo26PostprocessType postprocess = config_.postprocess;
+    if (postprocess == Yolo26PostprocessType::Auto)
+        postprocess = (config_.box_format == Yolo26BoxFormat::XYXY) ? Yolo26PostprocessType::TopK : Yolo26PostprocessType::NMS;
+
+    if (out_2d.h == det_dim && out_2d.w > 0)
+    {
+        const int num_anchors = out_2d.w;
+        const float* box_p0 = out_2d.row(0);
+        const float* box_p1 = out_2d.row(1);
+        const float* box_p2 = out_2d.row(2);
+        const float* box_p3 = out_2d.row(3);
+
+        std::vector<const float*> score_rows(config_.num_classes);
+        for (int c = 0; c < config_.num_classes; c++)
+        {
+            score_rows[c] = out_2d.row(4 + c);
+        }
+
+        std::vector<Yolo26Object> proposals;
+        if (postprocess == Yolo26PostprocessType::TopK)
+        {
+            const auto topk = yolo26::get_topk_index(
+                num_anchors, config_.num_classes, config_.max_det,
+                [&](int anchor, int cls) { return score_rows[cls][anchor]; });
+
+            proposals.reserve(topk.size());
+            for (const auto& cand : topk)
+            {
+                if (cand.score < config_.conf_threshold)
+                    continue;
+
+                const int i = cand.anchor;
+                const float p0 = box_p0[i];
+                const float p1 = box_p1[i];
+                const float p2 = box_p2[i];
+                const float p3 = box_p3[i];
+
+                Yolo26Object obj;
+                if (config_.box_format == Yolo26BoxFormat::CXCYWH)
+                {
+                    obj.x1 = p0 - p2 * 0.5f;
+                    obj.y1 = p1 - p3 * 0.5f;
+                    obj.x2 = p0 + p2 * 0.5f;
+                    obj.y2 = p1 + p3 * 0.5f;
+                }
+                else
+                {
+                    obj.x1 = p0;
+                    obj.y1 = p1;
+                    obj.x2 = p2;
+                    obj.y2 = p3;
+                }
+                obj.prob = cand.score;
+                obj.label = cand.cls;
+                proposals.push_back(obj);
+            }
+        }
+        else
+        {
+            proposals.reserve((size_t)num_anchors);
+            for (int i = 0; i < num_anchors; i++)
+            {
+                float best = score_rows[0][i];
+                int best_cls = 0;
+                for (int c = 1; c < config_.num_classes; c++)
+                {
+                    const float s = score_rows[c][i];
+                    if (s > best)
+                    {
+                        best = s;
+                        best_cls = c;
+                    }
+                }
+                if (best < config_.conf_threshold)
+                    continue;
+
+                const float p0 = box_p0[i];
+                const float p1 = box_p1[i];
+                const float p2 = box_p2[i];
+                const float p3 = box_p3[i];
+
+                Yolo26Object obj;
+                if (config_.box_format == Yolo26BoxFormat::CXCYWH)
+                {
+                    obj.x1 = p0 - p2 * 0.5f;
+                    obj.y1 = p1 - p3 * 0.5f;
+                    obj.x2 = p0 + p2 * 0.5f;
+                    obj.y2 = p1 + p3 * 0.5f;
+                }
+                else
+                {
+                    obj.x1 = p0;
+                    obj.y1 = p1;
+                    obj.x2 = p2;
+                    obj.y2 = p3;
+                }
+                obj.prob = best;
+                obj.label = best_cls;
+                proposals.push_back(obj);
+            }
+        }
+
+        objects.swap(proposals);
+    }
+    // Some converters may output [num_anchors, 4+nc] i.e. (8400, 84).
+    else if (out_2d.w == det_dim && out_2d.h > 0)
+    {
+        const int num_anchors = out_2d.h;
+
+        std::vector<Yolo26Object> proposals;
+        if (postprocess == Yolo26PostprocessType::TopK)
+        {
+            const auto topk = yolo26::get_topk_index(
+                num_anchors, config_.num_classes, config_.max_det,
+                [&](int anchor, int cls) { return out_2d.row(anchor)[4 + cls]; });
+
+            proposals.reserve(topk.size());
+            for (const auto& cand : topk)
+            {
+                if (cand.score < config_.conf_threshold)
+                    continue;
+
+                const float* p = out_2d.row(cand.anchor);
+                const float p0 = p[0];
+                const float p1 = p[1];
+                const float p2 = p[2];
+                const float p3 = p[3];
+
+                Yolo26Object obj;
+                if (config_.box_format == Yolo26BoxFormat::CXCYWH)
+                {
+                    obj.x1 = p0 - p2 * 0.5f;
+                    obj.y1 = p1 - p3 * 0.5f;
+                    obj.x2 = p0 + p2 * 0.5f;
+                    obj.y2 = p1 + p3 * 0.5f;
+                }
+                else
+                {
+                    obj.x1 = p0;
+                    obj.y1 = p1;
+                    obj.x2 = p2;
+                    obj.y2 = p3;
+                }
+                obj.prob = cand.score;
+                obj.label = cand.cls;
+                proposals.push_back(obj);
+            }
+        }
+        else
+        {
+            proposals.reserve((size_t)num_anchors);
+            for (int i = 0; i < num_anchors; i++)
+            {
+                const float* p = out_2d.row(i);
+
+                float best = p[4];
+                int best_cls = 0;
+                for (int c = 1; c < config_.num_classes; c++)
+                {
+                    const float s = p[4 + c];
+                    if (s > best)
+                    {
+                        best = s;
+                        best_cls = c;
+                    }
+                }
+                if (best < config_.conf_threshold)
+                    continue;
+
+                const float p0 = p[0];
+                const float p1 = p[1];
+                const float p2 = p[2];
+                const float p3 = p[3];
+
+                Yolo26Object obj;
+                if (config_.box_format == Yolo26BoxFormat::CXCYWH)
+                {
+                    obj.x1 = p0 - p2 * 0.5f;
+                    obj.y1 = p1 - p3 * 0.5f;
+                    obj.x2 = p0 + p2 * 0.5f;
+                    obj.y2 = p1 + p3 * 0.5f;
+                }
+                else
+                {
+                    obj.x1 = p0;
+                    obj.y1 = p1;
+                    obj.x2 = p2;
+                    obj.y2 = p3;
+                }
+                obj.prob = best;
+                obj.label = best_cls;
+                proposals.push_back(obj);
+            }
+        }
+
+        objects.swap(proposals);
+    }
+    // End-to-end export outputs (already top-k): [num_dets, 6] i.e. (300, 6) with xyxy + score + cls.
+    else if (out_2d.w == 6 && out_2d.h > 0)
+    {
+        std::vector<Yolo26Object> proposals;
+        const int num_dets = out_2d.h;
+        proposals.reserve(std::min(num_dets, config_.max_det));
+        for (int i = 0; i < num_dets; i++)
+        {
+            const float* p = out_2d.row(i);
+            float score = p[4];
+            if (score < config_.conf_threshold)
+                continue;
+
+            Yolo26Object obj;
+            obj.x1 = p[0];
+            obj.y1 = p[1];
+            obj.x2 = p[2];
+            obj.y2 = p[3];
+            obj.prob = score;
+            obj.label = (int)p[5];
+            proposals.push_back(obj);
+            if ((int)proposals.size() >= config_.max_det)
+                break;
+        }
+
+        objects.swap(proposals);
+    }
+    // Some converters may output [6, num_dets] i.e. (6, 300).
+    else if (out_2d.h == 6 && out_2d.w > 0)
+    {
+        const int num_dets = out_2d.w;
+        const float* x1_row = out_2d.row(0);
+        const float* y1_row = out_2d.row(1);
+        const float* x2_row = out_2d.row(2);
+        const float* y2_row = out_2d.row(3);
+        const float* score_row = out_2d.row(4);
+        const float* cls_row = out_2d.row(5);
+
+        std::vector<Yolo26Object> proposals;
+        proposals.reserve(std::min(num_dets, config_.max_det));
+        for (int i = 0; i < num_dets; i++)
+        {
+            const float score = score_row[i];
+            if (score < config_.conf_threshold)
+                continue;
+
+            Yolo26Object obj;
+            obj.x1 = x1_row[i];
+            obj.y1 = y1_row[i];
+            obj.x2 = x2_row[i];
+            obj.y2 = y2_row[i];
+            obj.prob = score;
+            obj.label = (int)cls_row[i];
+            proposals.push_back(obj);
+            if ((int)proposals.size() >= config_.max_det)
+                break;
+        }
+
+        objects.swap(proposals);
+    }
+    else
+    {
+        return false;
+    }
+
+    if (!is_end2end_out && postprocess == Yolo26PostprocessType::NMS)
+    {
+        objects = yolo26::nms(objects, config_.iou_threshold, config_.agnostic_nms);
+        if ((int)objects.size() > config_.max_det)
+            objects.resize((size_t)config_.max_det);
+    }
+
+    if (postprocess == Yolo26PostprocessType::TopK && config_.topk_dedup)
+    {
+        objects = yolo26::nms(objects, config_.iou_threshold, config_.agnostic_nms);
+        if ((int)objects.size() > config_.max_det)
+            objects.resize((size_t)config_.max_det);
+    }
+
+    for (auto& obj : objects)
+    {
+        float x1 = obj.x1;
+        float y1 = obj.y1;
+        float x2 = obj.x2;
+        float y2 = obj.y2;
+        yolo26::scale_xyxy_inplace(x1, y1, x2, y2, img_w, img_h, lb, true);
+
+        obj.x1 = x1;
+        obj.y1 = y1;
+        obj.x2 = x2;
+        obj.y2 = y2;
+    }
+
+    return true;
+}
